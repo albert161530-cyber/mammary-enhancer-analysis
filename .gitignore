@@ -1,0 +1,44 @@
+# ==========================================
+# 1. PYTHON Y COMPILACIÓN C++ (pybind11)
+# ==========================================
+__pycache__/
+*.pyc
+*.pyd
+*.so
+build/
+dist/
+*.egg-info/
+
+# ==========================================
+# 2. ARCHIVOS PESADOS DE ALINEAMIENTO (.maf)
+# ==========================================
+# Como se descargan automáticamente desde Google Drive, no deben subirse a GitHub
+*.maf
+
+# ==========================================
+# 3. BASES DE DATOS Y ANOTACIONES EXTERNAS
+# (Descargadas automáticamente por el script)
+# ==========================================
+*.bed
+*.bed.gz
+*.fasta
+*.meme.txt
+
+# ==========================================
+# 4. ARCHIVOS DE RESULTADOS Y CSVs GENERADOS
+# ==========================================
+comparacion_modelos_3_escenarios.csv
+deleciones_*.csv
+deleciones_todos_loci.csv
+efectos_motivo_*.csv
+efectos_motivo_todos_loci.csv
+estado_anotaciones_*.csv
+estado_anotaciones_todos_loci.csv
+interacciones_*.csv
+interacciones_no_aditivas_todos_loci.csv
+segmentos_e_MAF_*.csv
+sustituciones_candidatas_*.csv
+variantes_*.csv
+variantes_todos_loci.csv
+resultados_modelo_hormonal.csv
+disponibilidad_matrices_jaspar.csv
