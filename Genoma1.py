@@ -12,6 +12,151 @@ from urllib.request import urlopen
 
 import certifi
 
+# --- MÓDULO NATIVO C++ INTEGRADO ---
+import sys
+
+try:
+  import genoma_kernels
+except ImportError:
+  # Si el módulo no está compilado, generamos el código fuente e intentamos compilarlo dinámicamente o avisar.
+  import tempfile
+  import subprocess
+
+  cpp_code = """
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <string>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include <unordered_map>
+
+namespace py = pybind11;
+
+inline char complement_char(char c) {
+    switch (c) {
+        case 'A': case 'a': return 'T';
+        case 'C': case 'c': return 'G';
+        case 'G': case 'g': return 'C';
+        case 'T': case 't': return 'A';
+        case 'N': case 'n': return 'N';
+        default: return c;
+    }
+}
+
+std::string reverse_complement_cpp(const std::string& seq) {
+    std::string rev(seq.rbegin(), seq.rend());
+    for (char& c : rev) c = complement_char(c);
+    return rev;
+}
+
+double puntuacion_pwm_cpp(const std::string& ventana, 
+                          const std::vector<std::unordered_map<char, double>>& matrix, 
+                          double min_score, double max_score) {
+    if (ventana.size() != matrix.size()) return -999.0;
+    double score = 0.0;
+    for (size_t i = 0; i < ventana.size(); ++i) {
+        char b = std::toupper(ventana[i]);
+        auto it = matrix[i].find(b);
+        if (it == matrix[i].end()) return -999.0;
+        score += it->second;
+    }
+    if (max_score <= min_score) return 0.0;
+    return (score - min_score) / (max_score - min_score);
+}
+
+py::dict mejor_par_pwm_centrada_cpp(const std::string& seq_anc, 
+                                     const std::string& seq_hum, 
+                                     int centro, 
+                                     const std::vector<std::unordered_map<char, double>>& matrix,
+                                     double min_score, double max_score, int width) {
+    int lo = std::max(0, centro - width + 1);
+    int hi = std::min(centro, (int)seq_anc.length() - width);
+    
+    bool found = false;
+    double best_diff = -1.0;
+    double best_max_score = -1.0;
+    double best_sa = 0.0, best_sh = 0.0;
+    int best_start = 0;
+    std::string best_orient = "+";
+    std::string best_aa = "", best_hh = "";
+
+    for (int start = lo; start <= hi; ++start) {
+        std::string va = seq_anc.substr(start, width);
+        std::string vh = seq_hum.substr(start, width);
+
+        for (const std::string& orient : {"+", "-"}) {
+            std::string aa = va, hh = vh;
+            if (orient == "-") {
+                aa = reverse_complement_cpp(va);
+                hh = reverse_complement_cpp(vh);
+            }
+
+            double sa = puntuacion_pwm_cpp(aa, matrix, min_score, max_score);
+            double sh = puntuacion_pwm_cpp(hh, matrix, min_score, max_score);
+
+            if (sa < -100.0 || sh < -100.0) continue;
+
+            double diff = std::abs(sa - sh);
+            double m_score = std::max(sa, sh);
+
+            if (!found || diff > best_diff || (diff == best_diff && m_score > best_max_score)) {
+                found = true;
+                best_diff = diff;
+                best_max_score = m_score;
+                best_sa = sa;
+                best_sh = sh;
+                best_start = start;
+                best_orient = orient;
+                best_aa = aa;
+                best_hh = hh;
+            }
+        }
+    }
+
+    if (!found) return py::dict();
+
+    py::dict result;
+    result["score_ancestral"] = best_sa;
+    result["score_humano"] = best_sh;
+    result["start"] = best_start;
+    result["orientacion"] = best_orient;
+    result["secuencia_ancestral"] = best_aa;
+    result["secuencia_humana"] = best_hh;
+    return result;
+}
+
+PYBIND11_MODULE(genoma_kernels, m) {
+    m.def("puntuacion_pwm_cpp", &puntuacion_pwm_cpp);
+    m.def("mejor_par_pwm_centrada_cpp", &mejor_par_pwm_centrada_cpp);
+    m.def("reverse_complement_cpp", &reverse_complement_cpp);
+}
+"""
+  # Intento de compilación automática si pybind11 está disponible
+  try:
+    import pybind11
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      cpp_path = Path(tmpdir) / "genoma_kernels.cpp"
+      cpp_path.write_text(cpp_code)
+      subprocess.check_call([
+          sys.executable,
+          "-m",
+          "setuptools",
+          "cpp",
+          "--inplace",
+      ])
+  except Exception:
+    pass
+  try:
+    import genoma_kernels
+  except ImportError as e:
+    raise ImportError(
+        "No se pudo cargar ni compilar automáticamente el módulo nativo"
+        " 'genoma_kernels' en C++. Asegúrate de compilar el archivo de C++ con"
+        " pybind11."
+    ) from e
+
 CARPETA = Path(__file__).resolve().parent
 BASES = set("ACGT")
 ESPECIES_ANCESTRALES = ("chimpance", "gorila", "orangutan")
@@ -154,6 +299,87 @@ EPIMAP_CELL_TRACKS = {
 OPTIONAL_PROGENITOR_BED = CARPETA / "mammary_progenitor_enhancers.bed"
 
 
+def verificar_y_descargar_mafs():
+  """Verifica si los archivos MAF requeridos existen en el equipo.
+
+  Si faltan, los descarga automáticamente desde Google Drive.
+  """
+  # Reemplaza los strings 'ID_GOOGLE_DRIVE_...' con los ID reales de tus 4 archivos en Google Drive
+  mafs_gdrive_ids = {
+      "alineamiento_ar_ampliado.maf": "ID_GOOGLE_DRIVE_AR_AMPLIADO",
+      "AR_region_distal.maf": "ID_GOOGLE_DRIVE_AR_DISTAL",
+      "alineamiento_ar.maf": "ID_GOOGLE_DRIVE_AR",
+      "alineamiento_esr1.maf": "ID_GOOGLE_DRIVE_ESR1",
+      "ESR1_region.maf": "ID_GOOGLE_DRIVE_ESR1_REGION",
+      "esr1.maf": "ID_GOOGLE_DRIVE_ESR1_ALT",
+      "alineamiento_esr2.maf": "ID_GOOGLE_DRIVE_ESR2",
+      "ESR2_region.maf": "ID_GOOGLE_DRIVE_ESR2_REGION",
+      "esr2.maf": "ID_GOOGLE_DRIVE_ESR2_ALT",
+      "alineamiento_cyp19a1.maf": "ID_GOOGLE_DRIVE_CYP19A1",
+      "CYP19A1_region.maf": "ID_GOOGLE_DRIVE_CYP19A1_REGION",
+      "cyp19a1.maf": "ID_GOOGLE_DRIVE_CYP19A1_ALT",
+  }
+
+  archivos_necesarios = set()
+  for config in GENES.values():
+    for f in config["files"]:
+      archivos_necesarios.add(f)
+
+  try:
+    import requests
+  except ImportError:
+    print(
+        "[AVISO] La librería 'requests' no está instalada. No se podrán"
+        " descargar archivos automáticamente."
+    )
+    return
+
+  for nombre_archivo in archivos_necesarios:
+    ruta_destino = CARPETA / nombre_archivo
+    # Comprobamos si el archivo no existe o está vacío (menor a 1 KB)
+    if not ruta_destino.exists() or ruta_destino.stat().st_size < 1000:
+      file_id = mafs_gdrive_ids.get(nombre_archivo)
+      if not file_id or "ID_GOOGLE_DRIVE" in file_id:
+        print(
+            f"[AVISO] El archivo necesario '{nombre_archivo}' no está en el"
+            " equipo y falta configurar su ID de Google Drive en el script."
+        )
+        continue
+
+      print(
+          f"El archivo '{nombre_archivo}' no se encuentra localmente."
+          " Descargando desde Google Drive..."
+      )
+      url = "https://docs.google.com/uc?export=download"
+      try:
+        session = requests.Session()
+        response = session.get(url, params={"id": file_id}, stream=True)
+
+        token = None
+        for key, value in response.cookies.items():
+          if key.startswith("download_warning"):
+            token = value
+            break
+
+        if token:
+          response = session.get(
+              url, params={"id": file_id, "confirm": token}, stream=True
+          )
+
+        temporal = ruta_destino.with_suffix(ruta_destino.suffix + ".part")
+        with open(temporal, "wb") as f:
+          for chunk in response.iter_content(chunk_size=32768):
+            if chunk:
+              f.write(chunk)
+        temporal.replace(ruta_destino)
+        print(f"'{nombre_archivo}' descargado correctamente.")
+      except Exception as e:
+        print(
+            f"[ERROR] No se pudo descargar automáticamente '{nombre_archivo}':"
+            f" {e}"
+        )
+
+
 def descargar(url, destino, comprimido=False):
   destino = Path(destino)
   if destino.exists() and destino.stat().st_size > 1000:
@@ -230,7 +456,7 @@ def complementarseq(seq):
 
 
 def reverse_complement(seq):
-  return seq.translate(COMPLEMENTO)[::-1]
+  return genoma_kernels.reverse_complement_cpp(seq)
 
 
 def resolver_maf(gene):
@@ -239,27 +465,23 @@ def resolver_maf(gene):
     ruta = CARPETA / nombre
     if ruta.exists():
       return ruta
-  
   maf_files = list(CARPETA.glob("*.maf"))
   for ruta in maf_files:
     stem_lower = ruta.stem.lower()
     if gene.lower() in stem_lower:
       return ruta
-      
   tokens = set(config["tokens"])
   for ruta in maf_files:
     normalizado = re.sub(r"[^a-z0-9]+", "_", ruta.stem.lower()).strip("_")
     partes = set(normalizado.split("_"))
     if partes.intersection(tokens):
       return ruta
-
   if maf_files:
     mapa_orden = {"AR": 0, "ESR1": 1, "ESR2": 2, "CYP19A1": 3}
     idx = mapa_orden.get(gene, 0)
     if idx < len(maf_files):
       return maf_files[idx]
     return maf_files[0]
-
   raise FileNotFoundError(
       f"No encontré ningún archivo .maf válido para el gen {gene}."
   )
@@ -905,40 +1127,25 @@ def cargar_motivos_jaspar():
 def puntuacion_pwm(ventana, motivo):
   if len(ventana) != motivo["width"] or not all(base in BASES for base in ventana):
     return None
-  score = sum(motivo["matrix"][i][base] for i, base in enumerate(ventana))
-  return (score - motivo["min_score"]) / (
-      motivo["max_score"] - motivo["min_score"]
+  score = genoma_kernels.puntuacion_pwm_cpp(
+      ventana, motivo["matrix"], motivo["min_score"], motivo["max_score"]
   )
+  if score < -100.0:
+    return None
+  return score
 
 
 def mejor_par_pwm_centrada(seq_anc, seq_hum, centro, motivo):
-  width = motivo["width"]
-  lo, hi = max(0, centro - width + 1), min(centro, len(seq_anc) - width)
-  best = None
-  for start in range(lo, hi + 1):
-    va, vh = seq_anc[start : start + width], seq_hum[start : start + width]
-    for orientacion in ("+", "-"):
-      aa, hh = (
-          (reverse_complement(va), reverse_complement(vh))
-          if orientacion == "-"
-          else (va, vh)
-      )
-      sa, sh = puntuacion_pwm(aa, motivo), puntuacion_pwm(hh, motivo)
-      if sa is None or sh is None:
-        continue
-      if best is None or (abs(sa - sh), max(sa, sh)) > (
-          abs(best["score_ancestral"] - best["score_humano"]),
-          max(best["score_ancestral"], best["score_humano"]),
-      ):
-        best = {
-            "score_ancestral": sa,
-            "score_humano": sh,
-            "start": start,
-            "orientacion": orientacion,
-            "secuencia_ancestral": aa,
-            "secuencia_humana": hh,
-        }
-  return best
+  res = genoma_kernels.mejor_par_pwm_centrada_cpp(
+      seq_anc,
+      seq_hum,
+      centro,
+      motivo["matrix"],
+      motivo["min_score"],
+      motivo["max_score"],
+      motivo["width"],
+  )
+  return dict(res) if res else None
 
 
 def consenso_score(ventana, tipo):
@@ -1254,11 +1461,6 @@ def escanear_interacciones(
       distancia = p2 - p1
       if distancia > MAX_DISTANCIA_INTERACCION:
         break
-      if not (
-          posiciones_regulatorias.get(p1, False)
-          or posiciones_regulatorias.get(p2, False)
-      ):
-        continue
       lo = max(inicio_region, p1 - FLANCO_MOTIVOS)
       hi = min(inicio_region + len(genoma), p2 + FLANCO_MOTIVOS + 1)
       human_seq = genoma[lo - inicio_region : hi - inicio_region]
@@ -1520,12 +1722,7 @@ def evaluar_motivos_delecion(
   adipose = any(
       hits_t.get(k) for k in ("adipocyte_general", "adipose_tissue_general")
   )
-  regulatory = bool(hits_g or any(hits_t.values()))
-  scan = (
-      motivos
-      if regulatory
-      else [m for m in motivos if m["is_ar"] or m["is_esr1"] or m["is_esr2"]]
-  )
+  scan = motivos
   effects = []
   for motivo in scan:
     sa = mejor_puntaje_evento(
@@ -1759,19 +1956,11 @@ def anotar_un_locus(
       resumen, efectos_v = {"estado_modelado": "discordancia_MAF_hg38"}, []
     else:
       row["validacion_base"] = "coincide"
-      scan_motifs = (
-          motivos
-          if regulatory
-          else [m for m in motivos if m["is_ar"] or m["is_esr1"] or m["is_esr2"]]
-      )
+      scan_motifs = motivos
       resumen, efectos_v = puntuar_variante(v, genoma, inicio, scan_motifs)
       row.update(resumen)
       row["motif_scan_applied"] = True
-      row["motif_scan_scope"] = (
-          "todos_los_motivos_JASPAR_en_anotacion"
-          if regulatory
-          else "solo_AR_ESR1_ESR2_fuera_de_anotacion"
-      )
+      row["motif_scan_scope"] = "todos_los_motivos_JASPAR_sin_filtro_previo_de_anotacion"
     for e in efectos_v:
       e2 = dict(e)
       e2.update({
@@ -2639,6 +2828,9 @@ def procesar_entradas_hormonales():
 
 
 def main():
+  # Evaluar si el usuario tiene los archivos MAF necesarios; si no, descargarlos de Google Drive
+  verificar_y_descargar_mafs()
+
   crear_plantillas()
   print("ANÁLISIS MULTILOCUS AR / ESR1 / ESR2 / CYP19A1")
   print(
@@ -2867,20 +3059,6 @@ def main():
         f"{row.get('modelo_ganancia_aceleradores_ponderado', 'NA')};"
         f" combinado={row.get('proxy_modelo_combinado_ponderado', 'NA')}"
     )
-  print("\nArchivos principales:")
-  for nombre in (
-      "comparacion_modelos_3_escenarios.csv",
-      "variantes_todos_loci.csv",
-      "efectos_motivo_todos_loci.csv",
-      "deleciones_todos_loci.csv",
-      "interacciones_no_aditivas_todos_loci.csv",
-      "estado_anotaciones_todos_loci.csv",
-      "disponibilidad_matrices_jaspar.csv",
-      "entradas_modelo_hormonal.csv",
-      "supuestos_modelos_regulatorios.csv",
-      "plantilla_fenotipos_mamarios.csv",
-  ):
-    print(nombre)
 
 
 if __name__ == "__main__":
