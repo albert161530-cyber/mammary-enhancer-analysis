@@ -42,3 +42,8 @@ variantes_*.csv
 variantes_todos_loci.csv
 resultados_modelo_hormonal.csv
 disponibilidad_matrices_jaspar.csv
+# ==========================================
+# 5. CREDENCIALES Y CONFIGURACIÓN LOCAL
+# ==========================================
+api_key.txt
+*.key
