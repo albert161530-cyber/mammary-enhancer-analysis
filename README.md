@@ -137,6 +137,10 @@ python Genoma1.py && python automatizar_bloques.py && python auditoria_insercion
 
 This software is an **exploratory computational research suite**. Sequence-based PWM scoring, inferred ancestral consensus states, proximity overlaps, and deep-learning chromatin/transcription predictions (`AlphaGenome`) serve as high-resolution *in silico* hypotheses and molecular proxies. They are designed to prioritize candidate loci and variants for downstream wet-lab functional validation (such as Massively Parallel Reporter Assays [MPRA], ChIP-seq, or CRISPRi/a editing in 3D mammary organoids).
 
+Since the total execution of the repository takes approximately 20 hours, here is a folder with all the data and results after execution: https://drive.google.com/drive/u/0/folders/1mF9IdvVCiWCk4xWaQ_8Kg0_93LUjDDF-
+<img width="4500" height="3300" alt="resumen_validacion_alphagenome_mamario" src="https://github.com/user-attachments/assets/42de1eed-c065-4d66-907a-5af6d07c0670" />
+
+
 ---
 
 ## 📄 License
