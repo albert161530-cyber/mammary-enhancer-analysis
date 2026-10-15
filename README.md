@@ -841,5 +841,3 @@ Each resource should be cited according to the analysis for which it was used. C
 ## License
 
 Distributed under the MIT License. See `LICENSE` for more information.
-<img width="1024" height="750" alt="0e30b83c-bcae-4edd-9d87-2e3b162e7fc5" src="https://github.com/user-attachments/assets/456fdeb9-1d8e-4ed9-acba-75cec4b05dcd" />
-
