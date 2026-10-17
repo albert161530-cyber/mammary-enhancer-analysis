@@ -95,20 +95,20 @@ def calcular_actividad_enhancers():
       " vs Chimpancé)..."
   )
 
-  # Valores de los Enhancers derivados del análisis genómico (Escala normalizada 0 a 1)
-  # Humano: Mayor pérdida de frenos AR (menor actividad represora de AR) y mayor ganancia de ER
+  # Enhancer values derived from genomic analysis (Normalized scale 0 to 1)
+  # Human: Greater loss of AR brakes (less AR repressive activity) and greater gain of ER
   enhancer_ar_humano = (
-      0.35  # Menor frenado androgénico por pérdida de sitios en humanos
+      0.35  # Less androgenic braking due to loss of sites in humans
   )
   enhancer_er_humano = (
-      0.85  # Mayor ganancia/fijación de aceleradores estrogénicos en humanos
+      0.85  # Greater gain/fixation of estrogenic accelerators in humans
   )
 
-  # Chimpancé (Ancestral): Frenos de AR intactos (frenado fuerte) y menor ganancia de ER
+  # Chimpanzee (Ancestral): AR brakes intact (hard braking) and lower ER gain
   enhancer_ar_chimpance = (
-      0.90  # Frenos de AR fuertes y conservados en simios
+      0.90  # Strong and preserved AR brakes in apes
   )
-  enhancer_er_chimpance = 0.40  # Menor optimización de aceleradores estrogénicos
+  enhancer_er_chimpance = 0.40  # Less optimization of estrogenic accelerators
 
   ruta_hormonas = CARPETA / "entradas_modelo_hormonal.csv"
   if not ruta_hormonas.exists():
@@ -123,25 +123,25 @@ def calcular_actividad_enhancers():
         e2 = float(fila["estradiol_pg_ml"])
         t = float(fila["testosterona_ng_dl"])
 
-        # Proporción basal hormonal (Ratio E2 / T escalado)
+        # Basal Hormonal Ratio (Scaled E2/T Ratio)
         ratio_basal = e2 / max(t, 1.0)
 
-        # Consecuencia final: Actividad del Enhancer cruzada con cantidades basales y proporción
-        # Actividad ER Enhancer = Fuerza del Enhancer ER * Cantidad de E2 * Proporción
-        # Actividad AR Enhancer = Fuerza del Enhancer AR * Cantidad de T (actuando como freno)
+        # Final consequence: Enhancer activity crossed with basal amounts and ratio
+        # ER Enhancer Activity = ER Enhancer Strength *Amount of E2 *Ratio
+        # AR Enhancer Activity = AR Enhancer Strength *Amount of T (acting as a brake)
 
-        # 1. En Humanos
+        # 1. In Humans
         actividad_er_h = enhancer_er_humano * (e2 / 100.0) * ratio_basal
         actividad_ar_h = enhancer_ar_humano * (t / 100.0)
         neto_humano = actividad_er_h - actividad_ar_h
 
-        # 2. En Chimpancés (Estado Silvestre Ancestral)
+        # 2. In Chimpanzees (Ancestral Wild State)
         actividad_er_c = enhancer_er_chimpance * (e2 / 100.0) * ratio_basal
         actividad_ar_c = enhancer_ar_chimpance * (t / 100.0)
         neto_chimpance = actividad_er_c - actividad_ar_c
 
-        # 3. Escenario Hipotético: "Humanizar el Enhancer en el Chimpancé"
-        # ¿Qué pasa si al chimpancé le ponemos los enhancers humanos (AR humano + ER humano) pero con sus hormonas?
+        # 3. Hypothetical Scenario: "Humanize the Enhancer in the Chimpanzee"
+        # What happens if we give the chimpanzee human enhancers (human AR + human ER) but with their hormones?
         actividad_er_hum_c = enhancer_er_humano * (e2 / 100.0) * ratio_basal
         actividad_ar_hum_c = enhancer_ar_humano * (t / 100.0)
         neto_chimpance_humanizado = actividad_er_hum_c - actividad_ar_hum_c
@@ -169,7 +169,7 @@ def calcular_actividad_enhancers():
   guardar_csv(ruta_salida, salida_integrada)
   print(f"[OK] Resultados guardados en: {ruta_salida.name}")
 
-  # Impresión limpia en consola
+  # Clean printing on console
   print("\n" + "=" * 85)
   print(
       " MODELO EVOLUTIVO: ACTIVIDAD DE ENHANCERS AR/ER (HUMANO VS CHIMPANCÉ)"

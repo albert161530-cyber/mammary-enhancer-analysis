@@ -578,7 +578,7 @@ def process_region(model, region_items, region_number, ontology_terms, track_row
             }
     del baseline_output, baseline_blocks
 
-    # Predicción de cada variante individual sobre el mismo fondo genético humano.
+    # Prediction of each individual variant on the same human genetic background.
     single_jobs = []
     for variant_key in sorted(cats_by_variant):
         seq_chars = list(human_sequence)
@@ -624,7 +624,7 @@ def process_region(model, region_items, region_number, ontology_terms, track_row
     print(f"  Efectos individuales condicionados al fondo humano: {len(single_jobs)} variantes únicas")
     add_prediction_batch(model, single_jobs, interval, ontology_terms, single_callback, batch_size=3, workers=2)
 
-    # Predicción de los dos haplotipos conjuntos: solo se revierte a ancestral el grupo evaluado.
+    # Prediction of the two joint haplotypes: only the evaluated group reverts to ancestral.
     combined_map = {}
     for cat in CATEGORIAS:
         if not by_category[cat]:

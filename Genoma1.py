@@ -12,13 +12,13 @@ from urllib.request import urlopen
 
 import certifi
 
-# --- MÓDULO NATIVO C++ INTEGRADO ---
+# ---INTEGRATED NATIVE C++ MODULE ---
 import sys
 
 try:
   import genoma_kernels
 except ImportError:
-  # Si el módulo no está compilado, generamos el código fuente e intentamos compilarlo dinámicamente o avisar.
+  # If the module is not compiled, we generate the source code and try to compile it dynamically or prompt.
   import tempfile
   import subprocess
 
@@ -132,7 +132,7 @@ PYBIND11_MODULE(genoma_kernels, m) {
     m.def("reverse_complement_cpp", &reverse_complement_cpp);
 }
 """
-  # Intento de compilación automática si pybind11 está disponible
+  # Attempt to auto-build if pybind11 is available
   try:
     import pybind11
 
@@ -165,7 +165,7 @@ MIN_DELECION = 10
 MIN_E_NO_ALINEADO = 1000
 FLANCO_MOTIVOS = 40
 
-# --- UMBRALES EQUILIBRADOS ---
+# ---BALANCED THRESHOLDS ---
 UMBRAL_MOTIVO = 0.70
 DELTA_MOTIVO = 0.05
 MAX_DISTANCIA_INTERACCION = 30
@@ -300,11 +300,11 @@ OPTIONAL_PROGENITOR_BED = CARPETA / "mammary_progenitor_enhancers.bed"
 
 
 def verificar_y_descargar_mafs():
-  """Verifica si los archivos MAF requeridos existen en el equipo.
+  """Checks if the required MAF files exist on the computer.
 
-  Si faltan, los descarga automáticamente desde Google Drive.
+  If they are missing, it automatically downloads them from Google Drive.
   """
-  # Reemplaza los strings 'ID_GOOGLE_DRIVE_...' con los ID reales de tus 4 archivos en Google Drive
+  # Replace the 'ID_GOOGLE_DRIVE_...' strings with the actual IDs of your 4 files in Google Drive
   mafs_gdrive_ids = {
       "alineamiento_ar_ampliado.maf": "ID_GOOGLE_DRIVE_AR_AMPLIADO",
       "AR_region_distal.maf": "ID_GOOGLE_DRIVE_AR_DISTAL",
@@ -336,7 +336,7 @@ def verificar_y_descargar_mafs():
 
   for nombre_archivo in archivos_necesarios:
     ruta_destino = CARPETA / nombre_archivo
-    # Comprobamos si el archivo no existe o está vacío (menor a 1 KB)
+    # We check if the file does not exist or is empty (less than 1 KB)
     if not ruta_destino.exists() or ruta_destino.stat().st_size < 1000:
       file_id = mafs_gdrive_ids.get(nombre_archivo)
       if not file_id or "ID_GOOGLE_DRIVE" in file_id:
@@ -2828,7 +2828,7 @@ def procesar_entradas_hormonales():
 
 
 def main():
-  # Evaluar si el usuario tiene los archivos MAF necesarios; si no, descargarlos de Google Drive
+  # Evaluate whether the user has the necessary MAF files; If not, download them from Google Drive
   verificar_y_descargar_mafs()
 
   crear_plantillas()

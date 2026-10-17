@@ -6,7 +6,7 @@ ext_modules = [
         "genoma_kernels",
         ["genoma_kernels.cpp"],
         include_dirs=[pybind11.get_include()],
-        extra_compile_args=["/O2"],  # Optimización máxima para MSVC en Windows
+        extra_compile_args=["/O2"],  # Maximum optimization for MSVC on Windows
     ),
 ]
 

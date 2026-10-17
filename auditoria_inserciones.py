@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# -*-coding: utf-8 -*-
 """
-auditoria_inserciones.py
+audit_insertions.py
 ========================
-Módulo complementario (ortogonal a automatizar_bloques.py) para detectar, clasificar
-y evaluar en AlphaGenome las Inserciones Específicas del Linaje Humano (HSIs / Indels)
-en los 4 loci candidatos (AR, ESR1, ESR2, CYP19A1) sin repetir la corrida de SNVs/deleciones.
+Complementary module (orthogonal to automate_blocks.py) to detect, classify
+and evaluate Human Lineage Specific Insertions (HSIs /Indels) in AlphaGenome
+in the 4 candidate loci (AR, ESR1, ESR2, CYP19A1) without repeating the SNVs/deletions run.
 
-Versión Auto-Resume Inteligente:
-  - Lee tabla_5_impacto_inserciones_mamario.csv y procesa ÚNICAMENTE las regiones faltantes (ej. Región 6 si falló).
+Smart Auto-Resume Version:
+  -Read table_5_impact_inserciones_mamario.csv and process ONLY the missing regions (e.g. Region 6 if failed).
 """
 
 import argparse
@@ -41,7 +41,7 @@ ARCHIVO_SALIDA_INSERCIONES_CSV = CARPETA / "variantes_inserciones_loci.csv"
 ARCHIVO_SALIDA_TABLA5 = CARPETA / "tabla_5_impacto_inserciones_mamario.csv"
 ARCHIVO_SALIDA_RESUMEN_INS = CARPETA / "tabla_5_resumen_inserciones_por_modalidad.csv"
 
-CONTEXT_LENGTH = 1048576  # 1 Mb exacto requerido por AlphaGenome
+CONTEXT_LENGTH = 1048576  # Exact 1 Mb required by AlphaGenome
 
 LOCUS_MAP = {
     "chrX": "AR (chrX)",
