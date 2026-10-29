@@ -2700,6 +2700,66 @@ def muestrear_alt_en_coordenadas_ref(
     return result
 
 
+def obtener_ventana_referencia_con_cache(
+    chrom: str, center0: int, cache_dir: Path, length: int = LONGITUD_SECUENCIA,
+) -> tuple[int, str]:
+    """Recupera la ventana hg38 desde caché local o desde UCSC si aún no existe."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    window_cache = cache_dir / f"ucsc_hg38_{chrom}_{int(center0)}_{int(length)}.json.gz"
+    if window_cache.is_file():
+        try:
+            with gzip.open(window_cache, "rt", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            start0 = int(payload["start0"])
+            seq = str(payload["human_seq"]).upper()
+            if len(seq) == length and not (set(seq) - set("ACGTN")):
+                return start0, seq
+        except Exception:
+            pass
+    start0, seq = obtener_ventana_referencia(chrom, center0, length=length)
+    temp_path = window_cache.with_suffix(window_cache.suffix + ".tmp")
+    try:
+        with gzip.open(temp_path, "wt", encoding="utf-8", compresslevel=3) as handle:
+            json.dump({"start0": start0, "human_seq": seq}, handle, ensure_ascii=False)
+        os.replace(str(temp_path), str(window_cache))
+    except OSError:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return start0, seq
+
+
+def tarea_completada_en_cache(checkpoint: dict[str, Any], out_dir: Path, task_id: str) -> bool:
+    """Verifica que una tarea v5 figure como completada y su archivo .pkl.gz exista en disco."""
+    entry = checkpoint.get("tasks", {}).get(task_id)
+    if not isinstance(entry, dict) or entry.get("status") != "completed":
+        return False
+    cache_rel = limpiar(entry.get("cache_file", ""))
+    if not cache_rel:
+        return False
+    cache_path = out_dir / Path(cache_rel)
+    try:
+        return cache_path.is_file() and cache_path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def leer_csv_si_existe(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    try:
+        with path.open("r", newline="", encoding="utf-8-sig") as handle:
+            return [dict(row) for row in csv.DictReader(handle)]
+    except Exception as exc:
+        print(
+            f"  [AVISO CSV] No se pudo leer {path.name} para reutilizar filas previas: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr, flush=True,
+        )
+        return []
+
+
 def perfiles_locales_lote_con_checkpoint(
     model: Any,
     interval: Any,
@@ -2717,13 +2777,11 @@ def perfiles_locales_lote_con_checkpoint(
     alignment_events: list[dict[str, Any]] | None = None,
     baseline_profiles: dict[str, dict[str, Any]] | None = None,
     failed_modalities_this_run: set[str] | None = None,
+    max_task_retries: int = 3,
+    retry_failed_mode: bool = False,
+    consecutive_modality_failures: dict[str, int] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Predice y guarda cada modalidad en una RPC independiente.
-
-    Una modalidad lenta o fallida no invalida las demás. Los perfiles locales se
-    cachean por modalidad; en modo delta, ALT se remapea a coordenadas hg38 usando
-    offsets acumulados de los indels.
-    """
+    """Predice y guarda cada modalidad en una RPC independiente con reintentos automáticos."""
     import numpy as np
 
     checkpoint_path = out_dir / "evaluacion_deleciones_alphagenome_checkpoint.json"
@@ -2732,6 +2790,10 @@ def perfiles_locales_lote_con_checkpoint(
     baseline_profiles = baseline_profiles or {}
     target_centers_by_modality = target_centers_by_modality or {}
     failed_modalities_this_run = failed_modalities_this_run if failed_modalities_this_run is not None else set()
+    consecutive_modality_failures = (
+        consecutive_modality_failures if consecutive_modality_failures is not None else defaultdict(int)
+    )
+    max_task_retries = max(1, int(max_task_retries))
     cache_dir.mkdir(parents=True, exist_ok=True)
     payloads: dict[str, dict[str, Any]] = {}
     pending: dict[str, dict[str, Any]] = {}
@@ -2822,8 +2884,6 @@ def perfiles_locales_lote_con_checkpoint(
         guardar_json_atomico(checkpoint_path, checkpoint)
         return payloads
 
-    # Cada modalidad se solicita y se persiste por separado. Si una RPC agota el
-    # plazo, las siguientes modalidades aún se intentan y las completadas quedan cacheadas.
     for modality in missing:
         item = pending[modality]
         attr = item["attr"]
@@ -2832,50 +2892,77 @@ def perfiles_locales_lote_con_checkpoint(
             task.update({
                 "status": "not_attempted_due_to_modality_timeout",
                 "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                "last_error": f"Se omite en esta ejecución porque una RPC de {modality} falló previamente; se reintentará al iniciar otra ejecución.",
+                "last_error": (
+                    f"Se omite en esta ejecución porque {modality} acumuló múltiples fallos RPC consecutivos; "
+                    "se reintentará al ejecutar con --retry-failed."
+                ),
                 "blocked_by": [f"modality_timeout:{modality}"],
             })
             guardar_json_atomico(checkpoint_path, checkpoint)
-            print(f"      [OMITIDA {modality}] ya agotó el timeout en esta ejecución; no se repetirá por cada variante", flush=True)
+            print(f"      [OMITIDA {modality}] demasiados fallos consecutivos en este run", flush=True)
             continue
 
         radius = item["radius"]
         cache_path = item["cache_path"]
         task = item["task"]
-        task["attempts"] = int(task.get("attempts", 0)) + 1
-        task.update({
-            "status": "running", "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "cache_file": str(cache_path.relative_to(out_dir)), "last_error": "", "blocked_by": [],
-            "modality": modality, "kind": kind,
-        })
-        guardar_json_atomico(checkpoint_path, checkpoint)
-        print(
-            f"      [PREDICCIÓN {kind.upper()}] modalidad={modality}; "
-            f"secuencia={sequence_hash[:12]}; tarea={item['task_id']}",
-            flush=True,
-        )
-        try:
-            output = model.predict_sequence(
-                sequence=sequence,
-                interval=interval,
-                requested_outputs=[item["output_type"]],
-                ontology_terms=ontology_terms,
-            )
-        except Exception as exc:
-            message = f"{type(exc).__name__}: {exc}"
-            now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-            task.update({"status": "failed", "updated_at": now, "last_error": message})
-            task.setdefault("error_history", []).append(message)
-            checkpoint.setdefault("failure_history", []).append({
-                "timestamp": now, "task_id": item["task_id"],
-                "attempt": task["attempts"], "error": message,
+
+        output = None
+        last_rpc_exc: Exception | None = None
+        for attempt_idx in range(1, max_task_retries + 1):
+            task["attempts"] = int(task.get("attempts", 0)) + 1
+            task.update({
+                "status": "running", "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "cache_file": str(cache_path.relative_to(out_dir)), "last_error": "", "blocked_by": [],
+                "modality": modality, "kind": kind,
             })
-            if es_error_rpc_que_debe_detener_el_run(exc):
-                failed_modalities_this_run.add(modality)
             guardar_json_atomico(checkpoint_path, checkpoint)
+            retry_tag = f" (intento {attempt_idx}/{max_task_retries})" if max_task_retries > 1 else ""
             print(
-                f"      [FALLO SOLICITUD {modality}] {message}; "
-                f"se intentarán las demás modalidades; no se repetirá {modality} en este run",
+                f"      [PREDICCIÓN {kind.upper()}]{retry_tag} modalidad={modality}; "
+                f"secuencia={sequence_hash[:12]}; tarea={item['task_id']}",
+                flush=True,
+            )
+            try:
+                output = model.predict_sequence(
+                    sequence=sequence,
+                    interval=interval,
+                    requested_outputs=[item["output_type"]],
+                    ontology_terms=ontology_terms,
+                )
+                last_rpc_exc = None
+                consecutive_modality_failures[modality] = 0
+                break
+            except Exception as exc:
+                last_rpc_exc = exc
+                message = f"{type(exc).__name__}: {exc}"
+                now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+                task.update({"status": "failed", "updated_at": now, "last_error": message})
+                task.setdefault("error_history", []).append(message)
+                checkpoint.setdefault("failure_history", []).append({
+                    "timestamp": now, "task_id": item["task_id"],
+                    "attempt": task["attempts"], "error": message,
+                })
+                guardar_json_atomico(checkpoint_path, checkpoint)
+                if attempt_idx < max_task_retries and not isinstance(exc, MemoryError):
+                    wait_seconds = min(60, 5 * (2 ** (attempt_idx - 1)))
+                    print(
+                        f"      [REINTENTO {attempt_idx}/{max_task_retries} {modality}] {message}; "
+                        f"esperando {wait_seconds}s...",
+                        flush=True,
+                    )
+                    time.sleep(wait_seconds)
+
+        if last_rpc_exc is not None or output is None:
+            message = f"{type(last_rpc_exc).__name__}: {last_rpc_exc}"
+            if es_error_rpc_que_debe_detener_el_run(last_rpc_exc):
+                consecutive_modality_failures[modality] = int(consecutive_modality_failures.get(modality, 0)) + 1
+                # En modo --retry-failed no bloqueamos las demás tareas de la modalidad a la primera.
+                threshold = 5 if retry_failed_mode else 3
+                if consecutive_modality_failures[modality] >= threshold:
+                    failed_modalities_this_run.add(modality)
+            print(
+                f"      [FALLO SOLICITUD {modality}] {message} tras {max_task_retries} intento(s); "
+                "se continúa con el resto de tareas",
                 flush=True,
             )
             continue
@@ -2887,8 +2974,6 @@ def perfiles_locales_lote_con_checkpoint(
                 raise ValueError(f"AlphaGenome no devolvió tracks para {modality} con las ontologías solicitadas")
             values, metadata, grid_start, resolution = normalizar_array(track)
 
-            # Aplicar el filtro explícitamente antes de calcular perfiles y guardarlos.
-            # No asumimos que predict_sequence haya limitado los tracks a ontology_terms.
             if ontology_terms:
                 if "ontology_curie" not in getattr(metadata, "columns", []):
                     raise ValueError(
@@ -3018,6 +3103,7 @@ def perfiles_locales_lote_con_checkpoint(
 
     return payloads
 
+
 def track_factor_directo(metadata_row: dict[str, Any]) -> str:
     haystack = " ".join(limpiar(metadata_row.get(key, "")) for key in (
         "name", "target", "Assay title", "assay_title", "gene_symbol", "data_source"
@@ -3085,6 +3171,10 @@ def ejecutar_alphagenome(
     candidates: list[dict[str, Any]], region_contexts: list[dict[str, Any]],
     out_dir: Path, key_file: Path, ontology_terms: list[str], reset_checkpoint: bool = False,
     modality_names: list[str] | None = None,
+    retry_failed_only: bool = False,
+    recompute_from_cache: bool = False,
+    max_task_retries: int = 3,
+    rpc_timeout_seconds: int | None = None,
 ) -> None:
     import numpy as np
     try:
@@ -3134,14 +3224,16 @@ def ejecutar_alphagenome(
         print(
             "Método actualizado: perfiles REF y ALT por secuencia, una solicitud RPC independiente por modalidad faltante, "
             "caché local por modalidad/ventana, indels ancestrales individuales y haplotipos conjuntos "
-            "por categoría/región, y no-aditividad calculada sobre los mismos bins hg38. "
-            "Los resultados antiguos se archivan; sus cachés se conservan separadas por identidad y método.",
+            "por categoría/región, y no-aditividad calculada sobre los mismos bins hg38.",
             flush=True,
         )
     guardar_estado_checkpoint(out_dir, checkpoint)
 
     key = obtener_api_key(key_file)
-    rpc_timeout_seconds = max(30, int(os.environ.get("ALPHAGENOME_RPC_TIMEOUT_SECONDS", "300")))
+    if rpc_timeout_seconds is None:
+        rpc_timeout_seconds = max(30, int(os.environ.get("ALPHAGENOME_RPC_TIMEOUT_SECONDS", "600")))
+    else:
+        rpc_timeout_seconds = max(30, int(rpc_timeout_seconds))
     instalar_timeout_rpc_alphagenome(rpc_timeout_seconds)
     model = dna_client.create(key, timeout=30)
 
@@ -3166,37 +3258,108 @@ def ejecutar_alphagenome(
     }
     modality_specs = {name: all_specs[name] for name in chosen_names}
 
-    individual_rows: list[dict[str, Any]] = []
-    joint_rows: list[dict[str, Any]] = []
-    region_rows: list[dict[str, Any]] = []
+    # Cargar filas ya calculadas de ejecuciones previas para no descomprimir miles de .pkl.gz
+    # ni perder resultados de regiones ya completadas si se interrumpe la ejecución.
+    existing_ind_by_key: dict[tuple[int, str, str], list[dict[str, Any]]] = defaultdict(list)
+    existing_joint_by_key: dict[tuple[int, str, str], list[dict[str, Any]]] = defaultdict(list)
+    existing_ind_by_region: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    existing_joint_by_region: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    existing_region_by_id: dict[int, dict[str, Any]] = {}
+
+    if not reset_checkpoint and not recompute_from_cache:
+        for row in leer_csv_si_existe(out_dir / "evaluacion_deleciones_alphagenome_tracks.csv"):
+            try:
+                r_id = int(float(limpiar(row.get("region_id", "0"))))
+            except ValueError:
+                continue
+            v_id = limpiar(row.get("variant_id", ""))
+            mod = limpiar(row.get("modalidad", ""))
+            if r_id > 0 and v_id and mod and limpiar(row.get("track_id", "")):
+                existing_ind_by_key[(r_id, v_id, mod)].append(row)
+                existing_ind_by_region[r_id].append(row)
+
+        for row in leer_csv_si_existe(out_dir / "evaluacion_deleciones_impacto_conjunto_por_track.csv"):
+            try:
+                r_id = int(float(limpiar(row.get("region_id", "0"))))
+            except ValueError:
+                continue
+            cat = limpiar(row.get("categoria", ""))
+            mod = limpiar(row.get("modalidad", ""))
+            if r_id > 0 and cat and mod:
+                existing_joint_by_region[r_id].append(row)
+                if (
+                    limpiar(row.get("estado", "")) in {"completed", "single_variant_identity"}
+                    and limpiar(row.get("track_id", ""))
+                    and score_a_numero(row.get("efecto_conjunto_abs_L1")) is not None
+                ):
+                    existing_joint_by_key[(r_id, cat, mod)].append(row)
+
+        for row in leer_csv_si_existe(out_dir / "evaluacion_deleciones_haplotipos_regiones.csv"):
+            try:
+                r_id = int(float(limpiar(row.get("region_id", "0"))))
+            except ValueError:
+                continue
+            if r_id > 0:
+                existing_region_by_id[r_id] = row
+
+    rows_ind_by_region: dict[int, list[dict[str, Any]]] = {
+        r_id: list(rows) for r_id, rows in existing_ind_by_region.items()
+    }
+    rows_joint_by_region: dict[int, list[dict[str, Any]]] = {
+        r_id: list(rows) for r_id, rows in existing_joint_by_region.items()
+    }
+    rows_region_by_id: dict[int, dict[str, Any]] = dict(existing_region_by_id)
+
     started_all = time.monotonic()
     durations: list[float] = []
     failed_modalities_this_run: set[str] = set()
+    consecutive_modality_failures: dict[str, int] = defaultdict(int)
+
+    # Diagnóstico inicial de tareas fallidas / pendientes en el checkpoint
+    v5_tasks = {k: v for k, v in checkpoint.get("tasks", {}).items() if k.startswith("v5:")}
+    completed_v5 = [k for k, v in v5_tasks.items() if tarea_completada_en_cache(checkpoint, out_dir, k)]
+    failed_or_pending_v5 = [
+        (k, v.get("status", "unknown"), limpiar(v.get("last_error", "")))
+        for k, v in v5_tasks.items()
+        if v.get("status") != "superseded_previous_method" and not tarea_completada_en_cache(checkpoint, out_dir, k)
+    ]
 
     print(
         f"Candidatos seleccionados por C++ para AlphaGenome: {len(candidates)} | regiones: {len(region_contexts)}",
         flush=True,
     )
     print(
-        "Flujo integrado: una RPC independiente por modalidad y secuencia; calcula efectos individuales, "
-        "haplotipos multindel por categoría y no-aditividad. Si una modalidad agota el timeout, se omite el resto "
-        "de esa modalidad durante este run y continúan las demás; las modalidades completas se guardan en caché. "
-        "Los perfiles individuales se cachean por ventana local y se recargan uno por uno para no mantener todas las matrices en RAM.",
+        f"Estado previo en checkpoint: {len(completed_v5)} tareas v5 completadas en caché | "
+        f"{len(failed_or_pending_v5)} tareas v5 registradas como fallidas/pendientes.",
         flush=True,
     )
-    print(
-        "Alineamiento multindel usado en esta versión: predicción de la secuencia ALT reconstruida y remapeo de "
-        "los centros de señal a hg38 mediante offsets acumulados, con interpolación en límites fraccionarios de bin. "
-        "No se afirma que la API aplique indel stitching oficial a múltiples indels internos.",
-        flush=True,
-    )
-    print(f"Timeout RPC por solicitud: {rpc_timeout_seconds} s", flush=True)
+    if failed_or_pending_v5:
+        print("Tareas v5 a reintentar detectadas en checkpoint:", flush=True)
+        for t_id, t_status, t_err in failed_or_pending_v5[:25]:
+            short_err = (t_err[:120] + "...") if len(t_err) > 120 else t_err
+            print(f"  - {t_id} [{t_status}] {short_err}", flush=True)
+        if len(failed_or_pending_v5) > 25:
+            print(f"  ... y {len(failed_or_pending_v5) - 25} tarea(s) más.", flush=True)
+    print(f"Timeout RPC por solicitud: {rpc_timeout_seconds} s | Reintentos por tarea: {max_task_retries}", flush=True)
     print("Modalidades solicitadas: " + ",".join(chosen_names), flush=True)
     print("Ontologías solicitadas: " + ",".join(ontology_terms), flush=True)
     print(f"Checkpoint: {checkpoint_path}", flush=True)
     print(f"Caché: {cache_dir}", flush=True)
 
+    def reconstruir_listas_globales() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        all_ind: list[dict[str, Any]] = []
+        for r_id in sorted(rows_ind_by_region):
+            all_ind.extend(rows_ind_by_region[r_id])
+        all_joint: list[dict[str, Any]] = []
+        for r_id in sorted(rows_joint_by_region):
+            all_joint.extend(rows_joint_by_region[r_id])
+        all_reg: list[dict[str, Any]] = [
+            rows_region_by_id[r_id] for r_id in sorted(rows_region_by_id)
+        ]
+        return all_ind, all_joint, all_reg
+
     def guardar_tablas_parciales() -> None:
+        individual_rows, joint_rows, region_rows = reconstruir_listas_globales()
         individual_fields = list(dict.fromkeys(k for row in individual_rows for k in row.keys())) or [
             "region_id", "variant_id", "categoria", "modalidad", "track_id",
             "efecto_individual_firmado_humano_menos_ancestral", "magnitud_abs_L1_individual",
@@ -3228,19 +3391,14 @@ def ejecutar_alphagenome(
 
     failed_regions = 0
     stop_run = False
+    skipped_complete_regions = 0
+
     for region_no, context in enumerate(region_contexts, start=1):
         region = context.get("events", [])
         if not region:
             continue
         started_region = time.monotonic()
         chrom = normalizar_cromosoma(region[0]["cromosoma"])
-        start0 = int(context["start0"])
-        human_seq = str(context["human_seq"]).upper()
-        if len(human_seq) not in {16384, 131072, 524288, 1048576}:
-            raise ValueError(f"Longitud de contexto AlphaGenome no admitida: {len(human_seq)} bp")
-        if set(human_seq) - set("ACGTN"):
-            raise ValueError("La secuencia hg38 contiene símbolos no admitidos para AlphaGenome")
-        interval = genome.Interval(chromosome=chrom, start=start0, end=start0 + len(human_seq))
         positions = [int(event["punto_union_interbase_hg38_0based"]) for event in region]
         region_identity = (
             f"{chrom}_{min(positions)}_{max(positions)}_"
@@ -3253,68 +3411,15 @@ def ejecutar_alphagenome(
             raw = [event for event in region if category in event.get("categorias_hormonales", [])]
             category_events[category], category_conflicts[category] = eventos_insercion_unicos(raw)
 
-        print(
-            f"\n[REGIÓN {region_no}/{len(region_contexts)}] {chrom}:{min(positions)}-{max(positions)} | "
-            f"eventos={len(region)} | categorías={sum(bool(x) for x in category_events.values())}",
-            flush=True,
-        )
-        region_errors: list[str] = []
-        for category in CATEGORIAS_HORMONALES:
-            if category_conflicts.get(category):
-                print(
-                    f"  [AVISO {category}] se excluyen posiciones con alelos ancestrales incompatibles: "
-                    f"{category_conflicts[category][:12]}", flush=True,
-                )
-
         if not any(category_events.values()):
-            region_rows.append({
+            rows_region_by_id[region_no] = {
                 "region_id": region_no, "cromosoma": chrom, "n_eventos": len(region),
                 "estado": "sin_eventos_compatibles",
                 "detalle_error": "No hay secuencias ancestrales compatibles dentro de las categorías hormonales.",
-            })
+            }
             guardar_tablas_parciales()
             continue
 
-        try:
-            baseline_profiles = perfiles_locales_lote_con_checkpoint(
-                model, interval, human_seq, modality_specs, ontology_terms,
-                out_dir, cache_dir, checkpoint,
-                f"v5:{region_identity}:baseline", kind="baseline", target_sites=region,
-                failed_modalities_this_run=failed_modalities_this_run,
-            )
-        except Exception as exc:
-            message = f"baseline: {type(exc).__name__}: {exc}"
-            region_errors.append(message)
-            print(f"  [FALLO BASELINE] {message}", flush=True)
-            baseline_profiles = {}
-            if es_error_rpc_que_debe_detener_el_run(exc):
-                stop_run = True
-
-        missing_baseline_modalities = sorted(set(modality_specs) - set(baseline_profiles))
-        if missing_baseline_modalities:
-            region_errors.append("baseline sin modalidades: " + ",".join(missing_baseline_modalities))
-            print(
-                "  [AVISO BASELINE] modalidades no disponibles en esta región: "
-                + ",".join(missing_baseline_modalities), flush=True,
-            )
-
-        if not baseline_profiles:
-            state = "interrumpido_rpc_reanudable" if stop_run else "fallo_baseline"
-            region_rows.append({
-                "region_id": region_no, "cromosoma": chrom, "n_eventos": len(region),
-                "inicio_interbase_0based": min(positions), "fin_interbase_0based": max(positions),
-                "estado": state, "detalle_error": " | ".join(region_errors),
-            })
-            guardar_tablas_parciales()
-            if stop_run:
-                failed_regions += 1
-                break
-            continue
-
-        all_centers_by_modality = {
-            modality: np.asarray(profile["centers"], dtype=np.int64)
-            for modality, profile in baseline_profiles.items()
-        }
         all_events_by_id: dict[str, dict[str, Any]] = {}
         event_categories: dict[str, set[str]] = defaultdict(set)
         for category, sites in category_events.items():
@@ -3327,24 +3432,188 @@ def ejecutar_alphagenome(
             all_events_by_id.values(),
             key=lambda event: (int(event["punto_union_interbase_hg38_0based"]), str(event.get("variant_id", ""))),
         )
-        single_modalities_by_variant: dict[str, set[str]] = {}
 
+        # Determinar qué tareas individuales y conjuntas de esta región ya están 100% completas
+        # tanto en caché (.pkl.gz) como en los CSV existentes.
+        def single_esta_completo(variant_id: str, modality: str) -> bool:
+            if recompute_from_cache or reset_checkpoint:
+                return False
+            t_id = f"v5:{region_identity}:single:{variant_id}:{modality}"
+            if not tarea_completada_en_cache(checkpoint, out_dir, t_id):
+                return False
+            existing_rows = existing_ind_by_key.get((region_no, variant_id, modality), [])
+            if not existing_rows:
+                return False
+            present_cats = {limpiar(r.get("categoria", "")) for r in existing_rows}
+            return event_categories[variant_id].issubset(present_cats)
+
+        pending_single_by_variant: dict[str, list[str]] = {}
+        for event in ordered_events:
+            v_id = str(event.get("variant_id", ""))
+            pending_single_by_variant[v_id] = [
+                mod for mod in chosen_names if not single_esta_completo(v_id, mod)
+            ]
+
+        def joint_esta_completo(category: str, modality: str) -> bool:
+            if recompute_from_cache or reset_checkpoint:
+                return False
+            sites = category_events[category]
+            if not sites:
+                return True
+            for site in sites:
+                s_id = str(site.get("variant_id", ""))
+                if modality in pending_single_by_variant.get(s_id, []):
+                    return False
+                if not tarea_completada_en_cache(checkpoint, out_dir, f"v5:{region_identity}:single:{s_id}:{modality}"):
+                    return False
+            if len(sites) > 1:
+                j_id = f"v5:{region_identity}:joint:{category}:{modality}"
+                if not tarea_completada_en_cache(checkpoint, out_dir, j_id):
+                    return False
+            return bool(existing_joint_by_key.get((region_no, category, modality)))
+
+        pending_joint_by_category: dict[str, list[str]] = {}
+        for category in CATEGORIAS_HORMONALES:
+            sites = category_events[category]
+            if not sites:
+                pending_joint_by_category[category] = []
+            else:
+                pending_joint_by_category[category] = [
+                    mod for mod in chosen_names if not joint_esta_completo(category, mod)
+                ]
+
+        needed_modalities: set[str] = set()
+        for mods in pending_single_by_variant.values():
+            needed_modalities.update(mods)
+        for mods in pending_joint_by_category.values():
+            needed_modalities.update(mods)
+        for mod in chosen_names:
+            if not tarea_completada_en_cache(checkpoint, out_dir, f"v5:{region_identity}:baseline:{mod}"):
+                needed_modalities.add(mod)
+
+        if not needed_modalities:
+            skipped_complete_regions += 1
+            if region_no not in rows_region_by_id or rows_region_by_id[region_no].get("estado") != "completado_individuales_y_conjuntos":
+                rows_region_by_id[region_no] = {
+                    "region_id": region_no, "cromosoma": chrom, "n_eventos": len(region),
+                    "inicio_interbase_0based": min(positions), "fin_interbase_0based": max(positions),
+                    "ancho_contexto_bp": LONGITUD_SECUENCIA,
+                    "n_AR_loss": len(category_events["AR_loss"]), "n_ESR1_gain": len(category_events["ESR1_gain"]),
+                    "n_ERE_gain_shared": len(category_events["ERE_gain_shared"]), "n_ESR2_change": len(category_events["ESR2_change"]),
+                    "estado": "completado_individuales_y_conjuntos", "detalle_error": "",
+                    "nota_metodologica": "Región ya completada previamente; reutilizada sin descomprimir caché ni repetir llamadas RPC.",
+                    "duracion_segundos": rows_region_by_id.get(region_no, {}).get("duracion_segundos", 0.0),
+                }
+            print(
+                f"\n[REGIÓN {region_no}/{len(region_contexts)}] {chrom}:{min(positions)}-{max(positions)} | "
+                "100% completada en caché y CSV (se omite).",
+                flush=True,
+            )
+            continue
+
+        needed_ordered = [mod for mod in chosen_names if mod in needed_modalities]
+        n_pending_singles = sum(len(mods) for mods in pending_single_by_variant.values())
+        n_pending_joints = sum(len(mods) for mods in pending_joint_by_category.values())
         print(
-            f"  [REF GUARDADO] modalidades={','.join(baseline_profiles)}; "
-            f"bins locales por modalidad={ {k: len(v['centers']) for k, v in baseline_profiles.items()} }",
+            f"\n[REGIÓN {region_no}/{len(region_contexts)}] {chrom}:{min(positions)}-{max(positions)} | "
+            f"eventos={len(region)} | modalidades activas={','.join(needed_ordered)} | "
+            f"individuales pendientes={n_pending_singles} | conjuntos pendientes={n_pending_joints}",
             flush=True,
         )
 
-        # Un ALT individual por variante y región; cada modalidad faltante usa una RPC independiente.
+        # Obtener secuencia hg38 solo cuando la región realmente tiene tareas pendientes.
+        if context.get("human_seq") and context.get("start0") is not None:
+            start0 = int(context["start0"])
+            human_seq = str(context["human_seq"]).upper()
+        else:
+            midpoint = int(context["midpoint"])
+            start0, human_seq = obtener_ventana_referencia_con_cache(chrom, midpoint, cache_dir)
+            context["start0"] = start0
+            context["human_seq"] = human_seq
+
+        if len(human_seq) not in {16384, 131072, 524288, 1048576}:
+            raise ValueError(f"Longitud de contexto AlphaGenome no admitida: {len(human_seq)} bp")
+        if set(human_seq) - set("ACGTN"):
+            raise ValueError("La secuencia hg38 contiene símbolos no admitidos para AlphaGenome")
+        interval = genome.Interval(chromosome=chrom, start=start0, end=start0 + len(human_seq))
+
+        region_errors: list[str] = []
+        for category in CATEGORIAS_HORMONALES:
+            if category_conflicts.get(category):
+                print(
+                    f"  [AVISO {category}] se excluyen posiciones con alelos ancestrales incompatibles: "
+                    f"{category_conflicts[category][:12]}", flush=True,
+                )
+
+        active_modality_specs = {mod: modality_specs[mod] for mod in needed_ordered}
+        try:
+            baseline_profiles = perfiles_locales_lote_con_checkpoint(
+                model, interval, human_seq, active_modality_specs, ontology_terms,
+                out_dir, cache_dir, checkpoint,
+                f"v5:{region_identity}:baseline", kind="baseline", target_sites=region,
+                failed_modalities_this_run=failed_modalities_this_run,
+                max_task_retries=max_task_retries,
+                retry_failed_mode=retry_failed_only,
+                consecutive_modality_failures=consecutive_modality_failures,
+            )
+        except Exception as exc:
+            message = f"baseline: {type(exc).__name__}: {exc}"
+            region_errors.append(message)
+            print(f"  [FALLO BASELINE] {message}", flush=True)
+            baseline_profiles = {}
+            if es_error_rpc_que_debe_detener_el_run(exc):
+                stop_run = True
+
+        missing_baseline_modalities = sorted(set(active_modality_specs) - set(baseline_profiles))
+        if missing_baseline_modalities:
+            region_errors.append("baseline sin modalidades: " + ",".join(missing_baseline_modalities))
+            print(
+                "  [AVISO BASELINE] modalidades no disponibles en esta región: "
+                + ",".join(missing_baseline_modalities), flush=True,
+            )
+
+        if not baseline_profiles and needed_ordered:
+            state = "interrumpido_rpc_reanudable" if stop_run else "fallo_baseline"
+            rows_region_by_id[region_no] = {
+                "region_id": region_no, "cromosoma": chrom, "n_eventos": len(region),
+                "inicio_interbase_0based": min(positions), "fin_interbase_0based": max(positions),
+                "estado": state, "detalle_error": " | ".join(region_errors),
+            }
+            guardar_tablas_parciales()
+            if stop_run:
+                failed_regions += 1
+                break
+            continue
+
+        region_ind_rows: list[dict[str, Any]] = []
+        single_modalities_by_variant: dict[str, set[str]] = defaultdict(set)
+
         for event_idx, event in enumerate(ordered_events, start=1):
             variant_id = str(event.get("variant_id", ""))
+            pending_mods = set(pending_single_by_variant.get(variant_id, []))
+
+            # Reutilizar directamente las filas CSV de las modalidades ya completas para esta variante
+            for mod in chosen_names:
+                if mod not in pending_mods:
+                    region_ind_rows.extend(existing_ind_by_key.get((region_no, variant_id, mod), []))
+                    single_modalities_by_variant[variant_id].add(mod)
+
+            mods_to_run = [mod for mod in chosen_names if mod in pending_mods and mod in baseline_profiles]
+            missing_base_for_single = [mod for mod in chosen_names if mod in pending_mods and mod not in baseline_profiles]
+            if missing_base_for_single:
+                region_errors.append(f"single {variant_id}: sin baseline para {','.join(missing_base_for_single)}")
+
+            if not mods_to_run:
+                continue
+
             try:
                 position = int(event["punto_union_interbase_hg38_0based"])
                 alternate_sequence, single_events, _total_inserted = construir_secuencia_alternativa(
                     human_seq, start0, [event]
                 )
                 single_centers_by_modality: dict[str, Any] = {}
-                for modality, baseline in baseline_profiles.items():
+                for modality in mods_to_run:
+                    baseline = baseline_profiles[modality]
                     base_centers = np.asarray(baseline["centers"], dtype=np.int64)
                     radius = int(modality_specs[modality][2])
                     local_mask = np.abs(base_centers - position) <= radius
@@ -3352,6 +3621,7 @@ def ejecutar_alphagenome(
                         region_errors.append(f"single {variant_id}/{modality}: no hay bins en la ventana local")
                         continue
                     single_centers_by_modality[modality] = base_centers[local_mask]
+
                 delta_profiles = perfiles_locales_lote_con_checkpoint(
                     model, interval, alternate_sequence,
                     {name: modality_specs[name] for name in single_centers_by_modality}, ontology_terms,
@@ -3361,9 +3631,12 @@ def ejecutar_alphagenome(
                     alignment_events=single_events,
                     baseline_profiles={name: baseline_profiles[name] for name in single_centers_by_modality},
                     failed_modalities_this_run=failed_modalities_this_run,
+                    max_task_retries=max_task_retries,
+                    retry_failed_mode=retry_failed_only,
+                    consecutive_modality_failures=consecutive_modality_failures,
                 )
-                single_modalities_by_variant[variant_id] = set(delta_profiles)
-                missing_modes = sorted(set(baseline_profiles) - set(delta_profiles))
+                single_modalities_by_variant[variant_id].update(delta_profiles.keys())
+                missing_modes = sorted(set(single_centers_by_modality) - set(delta_profiles))
                 if missing_modes:
                     region_errors.append(f"single {variant_id}: faltan modalidades {','.join(missing_modes)}")
 
@@ -3398,7 +3671,7 @@ def ejecutar_alphagenome(
                                 direct_direction = "concordante" if signed < 0 else "discordante_o_nulo"
                             elif category == "ESR1_gain" and direct_factor == "ESR1":
                                 direct_direction = "concordante" if signed > 0 else "discordante_o_nulo"
-                            individual_rows.append({
+                            region_ind_rows.append({
                                 "region_id": region_no, "cromosoma": chrom,
                                 "inicio_region_interbase_0based": min(positions), "fin_region_interbase_0based": max(positions),
                                 "variant_id": variant_id, "gen_locus": event.get("gen_locus", ""),
@@ -3425,9 +3698,6 @@ def ejecutar_alphagenome(
                                 "direccion_concordante_track_factor_directo": direct_direction,
                                 "metodo": "predict_sequence de REF/ALT; señal ALT alineada a coordenadas hg38 por offsets acumulados de inserciones ancestrales.",
                             })
-                if event_idx % 25 == 0:
-                    print(f"  [INDIVIDUALES {event_idx}/{len(ordered_events)}] {region_identity}", flush=True)
-                # Keep per-variant profiles on disk; only scalar CSV rows and status remain in memory.
                 delta_profiles = None
                 delta_payload = None
                 base_local = None
@@ -3442,15 +3712,38 @@ def ejecutar_alphagenome(
                     stop_run = True
                     break
 
-        # Haplotipos compuestos y no-aditividad en las mismas coordenadas/track que la suma individual.
+        rows_ind_by_region[region_no] = region_ind_rows
+        region_joint_rows: list[dict[str, Any]] = []
+
         if not stop_run:
             for category in CATEGORIAS_HORMONALES:
                 sites = category_events[category]
                 if not sites:
                     continue
-                print(f"  [HAPLOTIPO {category}] variantes={len(sites)}", flush=True)
+                pending_cat_mods = set(pending_joint_by_category.get(category, []))
+
+                # Conservar las filas conjuntas de modalidades que ya estaban completas en esta categoría
+                for mod in chosen_names:
+                    if mod not in pending_cat_mods:
+                        region_joint_rows.extend(existing_joint_by_key.get((region_no, category, mod), []))
+
+                mods_for_cat = [mod for mod in chosen_names if mod in pending_cat_mods]
+                if not mods_for_cat:
+                    continue
+
+                print(
+                    f"  [HAPLOTIPO {category}] variantes={len(sites)} | modalidades a calcular={','.join(mods_for_cat)}",
+                    flush=True,
+                )
                 cat_data: dict[str, dict[str, Any]] = {}
-                for modality, baseline in baseline_profiles.items():
+                for modality in mods_for_cat:
+                    if modality not in baseline_profiles:
+                        cat_data[modality] = {
+                            "state": "fallo_baseline",
+                            "missing_events": [],
+                        }
+                        continue
+                    baseline = baseline_profiles[modality]
                     all_centers = np.asarray(baseline["centers"], dtype=np.int64)
                     radius = int(modality_specs[modality][2])
                     category_mask = centros_union_eventos(all_centers, sites, radius)
@@ -3481,6 +3774,9 @@ def ejecutar_alphagenome(
                                 alignment_events=single_events,
                                 baseline_profiles={modality: baseline_profiles[modality]},
                                 failed_modalities_this_run=failed_modalities_this_run,
+                                max_task_retries=max_task_retries,
+                                retry_failed_mode=retry_failed_only,
+                                consecutive_modality_failures=consecutive_modality_failures,
                             )
                             payload = one_payloads.get(modality)
                             if payload is None:
@@ -3496,7 +3792,6 @@ def ejecutar_alphagenome(
                             delta_single_local = np.asarray(payload["delta"], dtype=np.float32)
                             sum_single_delta[indexes, :] += delta_single_local
                             sum_single_abs += np.sum(np.abs(delta_single_local), axis=0, dtype=np.float64)
-                            # Explicitly drop the decompressed cache object before the next variant.
                             payload = None
                             one_payloads = None
                             alt_sequence = None
@@ -3523,7 +3818,6 @@ def ejecutar_alphagenome(
                 joint_payloads: dict[str, dict[str, Any]] = {}
                 joint_error = ""
                 if len(sites) == 1:
-                    # Identidad exacta: para un solo indel el efecto conjunto es el individual; no se hace RPC adicional.
                     for modality in valid_modes:
                         joint_payloads[modality] = {
                             "delta": cat_data[modality]["sum_single_delta"],
@@ -3544,6 +3838,9 @@ def ejecutar_alphagenome(
                             alignment_events=joint_events,
                             baseline_profiles={m: cat_data[m]["base_cat"] for m in valid_modes},
                             failed_modalities_this_run=failed_modalities_this_run,
+                            max_task_retries=max_task_retries,
+                            retry_failed_mode=retry_failed_only,
+                            consecutive_modality_failures=consecutive_modality_failures,
                         )
                         lost = sorted(set(valid_modes) - set(joint_payloads))
                         if lost:
@@ -3557,7 +3854,8 @@ def ejecutar_alphagenome(
 
                 for modality, item in cat_data.items():
                     if item["state"] != "ready":
-                        joint_rows.append({
+                        region_errors.append(f"joint {category}/{modality}: {item['state']}")
+                        region_joint_rows.append({
                             "region_id": region_no, "cromosoma": chrom, "categoria": category,
                             "modalidad": modality, "n_variantes_conjuntas": len(sites),
                             "estado": item["state"],
@@ -3566,7 +3864,8 @@ def ejecutar_alphagenome(
                         })
                         continue
                     if modality not in joint_payloads:
-                        joint_rows.append({
+                        region_errors.append(f"joint {category}/{modality}: fallo_prediccion_conjunta")
+                        region_joint_rows.append({
                             "region_id": region_no, "cromosoma": chrom, "categoria": category,
                             "modalidad": modality, "n_variantes_conjuntas": len(sites),
                             "estado": "fallo_prediccion_conjunta", "detalle_error": joint_error or "sin perfil conjunto",
@@ -3596,7 +3895,7 @@ def ejecutar_alphagenome(
                             direct_direction = "concordante" if signed_joint < 0 else "discordante_o_nulo"
                         elif category == "ESR1_gain" and direct_factor == "ESR1":
                             direct_direction = "concordante" if signed_joint > 0 else "discordante_o_nulo"
-                        joint_rows.append({
+                        region_joint_rows.append({
                             "region_id": region_no, "cromosoma": chrom,
                             "inicio_region_interbase_0based": min(positions), "fin_region_interbase_0based": max(positions),
                             "categoria": category, "modalidad": modality, "track_id": track_id,
@@ -3620,14 +3919,14 @@ def ejecutar_alphagenome(
                         })
                 if stop_run:
                     break
-            if stop_run:
-                pass
+
+        rows_joint_by_region[region_no] = region_joint_rows
 
         elapsed_region = time.monotonic() - started_region
         state = "completado_con_errores" if region_errors else "completado_individuales_y_conjuntos"
         if stop_run:
             state = "interrumpido_rpc_reanudable"
-        region_rows.append({
+        rows_region_by_id[region_no] = {
             "region_id": region_no, "cromosoma": chrom, "n_eventos": len(region),
             "inicio_interbase_0based": min(positions), "fin_interbase_0based": max(positions),
             "ancho_contexto_bp": len(human_seq),
@@ -3637,12 +3936,10 @@ def ejecutar_alphagenome(
             "nota_metodologica": (
                 "Predicción REF humana y ALT ancestral. Deltas locales por modalidad; haplotipos de todos los indels "
                 "compatibles dentro de cada categoría/región; no-aditividad = delta conjunto - suma delta individual "
-                "en la unión de ventanas hg38; cada delta individual se incorpora solo dentro de su propia ventana por modalidad. "
-                "La asignación ALT→REF usa offsets acumulados e interpolación en fracciones de bin; la alineación multindel es "
-                "una implementación propia que requiere validación independiente."
+                "en la unión de ventanas hg38; cada delta individual se incorpora solo dentro de su propia ventana por modalidad."
             ),
             "duracion_segundos": round(elapsed_region, 2),
-        })
+        }
         guardar_tablas_parciales()
         durations.append(time.monotonic() - started_region)
         if stop_run:
@@ -3652,6 +3949,7 @@ def ejecutar_alphagenome(
         remaining = len(region_contexts) - region_no
         print(f"  [REGIÓN {state}] duración={durations[-1]:.1f}s; ETA regiones restantes≈{average * remaining:.1f}s", flush=True)
 
+    individual_rows, joint_rows, _region_rows = reconstruir_listas_globales()
     comparison = comparar_efectos_individuales(individual_rows)
     escribir_csv(
         out_dir / "evaluacion_deleciones_comparacion_individual_AR_vs_ESR1.csv", comparison,
@@ -3687,19 +3985,21 @@ def ejecutar_alphagenome(
     )
     guardar_estado_checkpoint(out_dir, checkpoint)
     failed_tasks = sum(
-        task.get("status") in {"failed", "running", "blocked_by_failed_individuals"}
+        task.get("status") not in {"completed", "superseded_previous_method"}
         for task_id, task in checkpoint.get("tasks", {}).items() if task_id.startswith("v5:")
     )
     elapsed = time.monotonic() - started_all
     print(f"\nAlphaGenome terminó en {elapsed/60:.1f} min.", flush=True)
-    print(f"Tareas v5 fallidas/en curso: {failed_tasks}", flush=True)
+    print(f"Regiones ya completas omitidas directamente: {skipped_complete_regions}/{len(region_contexts)}", flush=True)
+    print(f"Tareas v5 fallidas/pendientes tras esta ejecución: {failed_tasks}", flush=True)
     print(f"Regiones detenidas por RPC: {failed_regions}", flush=True)
     print(f"Estado reanudable: {checkpoint_path}", flush=True)
     print(f"Individuales: {out_dir / 'evaluacion_deleciones_alphagenome_tracks.csv'}", flush=True)
     print(f"Conjuntos/no-aditividad: {out_dir / 'evaluacion_deleciones_impacto_conjunto_por_track.csv'}", flush=True)
     print(f"Comparación AR vs ESR1: {out_dir / 'evaluacion_deleciones_comparacion_AR_vs_ESR1.csv'}", flush=True)
-    if stop_run:
-        print("El run se detuvo por un error de solicitud; al repetir el mismo comando se reutilizan perfiles cacheados.", flush=True)
+    if failed_tasks > 0:
+        print("Aún quedan tareas pendientes; vuelve a ejecutar con --retry-failed para reintentarlas.", flush=True)
+
 
 def leer_csv_generico(path: Path) -> list[dict[str, str]]:
     if not path.exists():
@@ -3708,13 +4008,13 @@ def leer_csv_generico(path: Path) -> list[dict[str, str]]:
         return [dict(row) for row in csv.DictReader(handle)]
 
 
-def cargar_filtro_previo_y_contextos(out_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+def cargar_filtro_previo_y_contextos(
+    out_dir: Path, defer_sequence_fetch: bool = True,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
     """Carga la selección PWM previa sin volver a ejecutar MAF ni el filtro C++.
 
-    El CSV de candidatos guarda las variantes validadas; el CSV de motivos guarda
-    las categorías ya calculadas. Se mantiene la agrupación regional de TODOS los
-    candidatos originales y solo se vuelve a recuperar hg38 para los contextos
-    AlphaGenome de las regiones que contienen eventos seleccionados.
+    Si defer_sequence_fetch=True, calcula el punto medio exacto de cada región pero
+    difiere la descarga de hg38 (UCSC) hasta comprobar si la región tiene tareas pendientes.
     """
     candidate_path = out_dir / "evaluacion_deleciones_candidatos.csv"
     motif_path = out_dir / "evaluacion_deleciones_motivos_hormonales.csv"
@@ -3792,13 +4092,10 @@ def cargar_filtro_previo_y_contextos(out_dir: Path) -> tuple[list[dict[str, Any]
     ]
     print(
         f"Reutilizando filtro PWM previo: {len(motif_rows)} candidatos evaluados; "
-        f"{len(selected)} seleccionados. No se volverán a escanear los MAF ni a ejecutar C++. ",
+        f"{len(selected)} seleccionados en {len(regions_with_hits)} regiones.",
         flush=True,
     )
-    print(
-        f"Recuperando secuencias hg38 para {len(regions_with_hits)} regiones AlphaGenome…",
-        flush=True,
-    )
+    cache_dir = out_dir / "alphagenome_cache"
     for region_no, region in enumerate(regions_with_hits, start=1):
         chrom = region[0]["cromosoma"]
         positions = [int(item["punto_union_interbase_hg38_0based"]) for item in region]
@@ -3812,19 +4109,28 @@ def cargar_filtro_previo_y_contextos(out_dir: Path) -> tuple[list[dict[str, Any]
             length for pos, length in insertion_by_position.items() if pos < max(positions)
         )
         midpoint = (min(positions) + effective_max) // 2
-        try:
-            start0, human_seq = obtener_ventana_referencia(chrom, midpoint)
-        except Exception as exc:
-            raise RuntimeError(
-                f"No se pudo recuperar la secuencia hg38 de la región {region_no}/{len(regions_with_hits)} "
-                f"({chrom}:{min(positions)}-{max(positions)}): {exc}"
-            ) from exc
         passing_region = [event for event in region if event.get("categorias_hormonales")]
-        contexts.append({"events": passing_region, "start0": start0, "human_seq": human_seq})
-        print(
-            f"  [CONTEXTO {region_no}/{len(regions_with_hits)}] {chrom}:{min(positions)}-{max(positions)} listo",
-            flush=True,
-        )
+        if defer_sequence_fetch:
+            contexts.append({
+                "events": passing_region,
+                "chrom": chrom,
+                "midpoint": midpoint,
+                "start0": None,
+                "human_seq": None,
+            })
+        else:
+            start0, human_seq = obtener_ventana_referencia_con_cache(chrom, midpoint, cache_dir)
+            contexts.append({
+                "events": passing_region,
+                "chrom": chrom,
+                "midpoint": midpoint,
+                "start0": start0,
+                "human_seq": human_seq,
+            })
+            print(
+                f"  [CONTEXTO {region_no}/{len(regions_with_hits)}] {chrom}:{min(positions)}-{max(positions)} listo",
+                flush=True,
+            )
     return selected, contexts, len(motif_rows)
 
 
@@ -3833,7 +4139,9 @@ def ejecutar_alphagenome_desde_filtro_previo(args: argparse.Namespace) -> int:
     terms = [term.strip() for term in args.ontology_terms.split(",") if term.strip()]
     if not terms:
         raise ValueError("No quedan ontology_terms válidos después de procesar --ontology-terms")
-    selected, screened_contexts, n_total = cargar_filtro_previo_y_contextos(args.out_dir)
+    selected, screened_contexts, n_total = cargar_filtro_previo_y_contextos(
+        args.out_dir, defer_sequence_fetch=True
+    )
     if not selected:
         crear_salidas_alphagenome_vacias(
             args.out_dir,
@@ -3849,8 +4157,10 @@ def ejecutar_alphagenome_desde_filtro_previo(args: argparse.Namespace) -> int:
         if kept:
             region_contexts.append({
                 "events": kept,
-                "start0": context["start0"],
-                "human_seq": context["human_seq"],
+                "chrom": context.get("chrom"),
+                "midpoint": context.get("midpoint"),
+                "start0": context.get("start0"),
+                "human_seq": context.get("human_seq"),
             })
     print(
         f"AlphaGenome: filtro previo reutilizado ({n_total} evaluados; "
@@ -3865,6 +4175,10 @@ def ejecutar_alphagenome_desde_filtro_previo(args: argparse.Namespace) -> int:
         ontology_terms=terms,
         reset_checkpoint=args.reset_checkpoint,
         modality_names=[x.strip().upper() for x in args.modalities.split(",") if x.strip()],
+        retry_failed_only=args.retry_failed,
+        recompute_from_cache=args.recompute_from_cache,
+        max_task_retries=args.max_task_retries,
+        rpc_timeout_seconds=args.rpc_timeout,
     )
     return 0
 
@@ -3884,6 +4198,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-small-indel-scan", action="store_true", help="Desactiva la búsqueda suplementaria de huecos de 1–9 pb en MAF")
     parser.add_argument("--max-events", type=int, default=None, help="Limita candidatos que ya pasaron el filtro PWM C++ y se envían a AlphaGenome")
     parser.add_argument("--run-alphagenome", action="store_true", help="Ejecuta AlphaGenome reutilizando los CSV del filtro PWM existentes; si faltan, los genera")
+    parser.add_argument(
+        "--retry-failed", "--only-failed", dest="retry_failed", action="store_true",
+        help="Reintenta únicamente las tareas AlphaGenome fallidas/pendientes y los haplotipos bloqueados, reutilizando las filas CSV de regiones/variantes ya completadas",
+    )
+    parser.add_argument(
+        "--recompute-from-cache", action="store_true",
+        help="Fuerza a reconstruir todas las filas de los CSV descomprimiendo los perfiles .pkl.gz de alphagenome_cache",
+    )
+    parser.add_argument(
+        "--max-task-retries", type=int, default=3,
+        help="Número de intentos por tarea RPC de AlphaGenome antes de darla por fallida (por defecto 3)",
+    )
+    parser.add_argument(
+        "--rpc-timeout", type=int, default=600,
+        help="Timeout en segundos para cada llamada RPC a AlphaGenome (por defecto 600)",
+    )
     parser.add_argument("--rebuild-motif-filter", action="store_true", help="Fuerza reconstrucción de candidatos y ejecución de C++ incluso con --run-alphagenome")
     parser.add_argument("--reset-checkpoint", action="store_true", help="Borra el checkpoint y la caché persistente de AlphaGenome para empezar desde cero")
     parser.add_argument("--ontology-terms", default=",".join(ONTOLOGIAS_MAMARIAS_DEFAULT), help="CURIEs separados por coma para filtrar tracks; por defecto, tejidos/células mamarias")
@@ -3896,6 +4226,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.retry_failed:
+        args.run_alphagenome = True
     if args.min_consensus_support < 2:
         raise ValueError("--min-consensus-support debe ser al menos 2")
     if args.max_events is not None and args.max_events < 1:
@@ -3905,8 +4237,6 @@ def main() -> int:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Si el usuario ya ejecutó el filtro, `--run-alphagenome` reutiliza esos CSV.
-    # Así no vuelve a recorrer todos los MAF ni repite el filtro C++ de varios minutos.
     prior_candidates = args.out_dir / "evaluacion_deleciones_candidatos.csv"
     prior_motifs = args.out_dir / "evaluacion_deleciones_motivos_hormonales.csv"
     if args.run_alphagenome and not args.rebuild_motif_filter and prior_candidates.exists() and prior_motifs.exists():
@@ -3947,11 +4277,9 @@ def main() -> int:
             candidates.extend(supplemental_added)
             validation.extend(supplemental_validation)
         else:
-            # También se registra el estado de reconstrucción aunque no haya eventos adecuados.
             _, supplemental_validation = preparar_candidatos(seed_rows, args.min_consensus_support)
             validation.extend(supplemental_validation)
 
-    # Enlaza cada hueco MAF escaneado con el estado final de deduplicación/reconstrucción.
     for scan in scan_rows:
         scan["estado_final"] = scan.get("estado", "")
         if scan.get("estado") == "LISTO_PARA_VALIDACION":
@@ -3979,7 +4307,6 @@ def main() -> int:
     ]
     escribir_csv(args.out_dir / "evaluacion_indels_pequenos_maf_resumen.csv", maf_summary, maf_summary_fields)
 
-    n_valid = sum(row.get("estado_validacion") == "lista_para_validar_referencia" for row in validation)
     n_reject = sum(str(row.get("estado_validacion", "")).startswith("rechazada") for row in validation)
     n_small_found = sum(row.get("estado") == "LISTO_PARA_VALIDACION" for row in scan_rows)
     n_small_accepted = len(supplemental_added)
@@ -4043,6 +4370,10 @@ def main() -> int:
         ontology_terms=terms,
         reset_checkpoint=args.reset_checkpoint,
         modality_names=[x.strip().upper() for x in args.modalities.split(",") if x.strip()],
+        retry_failed_only=args.retry_failed,
+        recompute_from_cache=args.recompute_from_cache,
+        max_task_retries=args.max_task_retries,
+        rpc_timeout_seconds=args.rpc_timeout,
     )
     return 0
 
